@@ -1,98 +1,127 @@
-import time
+import argparse
 import numpy as np
-import sounddevice as sd
-import matplotlib.pyplot as plt
 
 from src.fft_analysis import compute_fft
-from src.tone_activity import band_energy_fft, calibrate_threshold
+from src.tone_activity import band_energy_fft
+from src.morse_map import decode_symbol
+from src.wav_input import load_wav_mono_resampled
 
-FS = 44100
+FS_DEFAULT = 44100
 FC = 800.0
-BW = 60.0
-FRAME_SEC = 0.05
-CALIB_SEC = 2.0
+BW = 180.0
+FRAME_SEC = 0.02
 
-def now():
-    return time.time()
+WAV_SKIP_SEC = 0.00
+SCAN_SEC = 4.0
 
-def rec_frame(frame_len):
-    x = sd.rec(frame_len, samplerate=FS, channels=1, dtype="float32")
-    try:
-        sd.wait()
-    except KeyboardInterrupt:
-        try:
-            sd.stop()
-        except Exception:
-            pass
-        raise
-    return x[:, 0]
+
+def compute_energy_series(x, fs):
+    frame_len = int(fs * FRAME_SEC)
+    n_frames = len(x) // frame_len
+    energies = np.zeros(n_frames, dtype=np.float32)
+
+    for i in range(n_frames):
+        fr = x[i * frame_len : (i + 1) * frame_len]
+        freqs, mag = compute_fft(fr, fs)
+        energies[i] = band_energy_fft(freqs, mag, fc=FC, bw=BW)
+
+    return energies
+
+
+def pick_threshold(energies):
+    e = np.asarray(energies, dtype=np.float32)
+    e = e[np.isfinite(e)]
+    if e.size == 0:
+        return 0.0
+
+    lo = float(np.percentile(e, 10))
+    hi = float(np.percentile(e, 90))
+    thr = 0.5 * (lo + hi)
+    return thr
+
+
+def run_length_encode(bits):
+    if len(bits) == 0:
+        return []
+    runs = []
+    cur = bits[0]
+    count = 1
+    for b in bits[1:]:
+        if b == cur:
+            count += 1
+        else:
+            runs.append((cur, count))
+            cur = b
+            count = 1
+    runs.append((cur, count))
+    return runs
+
+
+def decode_offline_wav(x, fs):
+    energies = compute_energy_series(x, fs)
+    thr = pick_threshold(energies)
+
+    on = energies >= thr
+
+    runs = run_length_encode(on.tolist())
+
+    on_lens = np.array([cnt for val, cnt in runs if val], dtype=np.float32)
+    if on_lens.size == 0:
+        return ""
+
+    dot_frames = float(np.percentile(on_lens, 30))
+    dot_frames = max(dot_frames, 1.0)
+    dash_frames = 3.0 * dot_frames
+
+    intra_off = 1.5 * dot_frames
+    letter_off = 3.0 * dot_frames
+    word_off = 7.0 * dot_frames
+
+    current = ""
+    out = []
+
+    def flush_letter():
+        nonlocal current
+        if current != "":
+            out.append(decode_symbol(current))
+            current = ""
+
+    for val, cnt in runs:
+        if val:
+            if cnt < 2.0 * dot_frames:
+                current += "."
+            else:
+                current += "-"
+        else:
+            if cnt < intra_off:
+                continue
+            if cnt >= word_off:
+                flush_letter()
+                if len(out) == 0 or out[-1] != " ":
+                    out.append(" ")
+            elif cnt >= letter_off:
+                flush_letter()
+
+    flush_letter()
+    return "".join(out)
+
 
 def main():
-    frame_len = int(FS * FRAME_SEC)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wav", type=str, required=True)
+    args = ap.parse_args()
 
-    print("EECS150 Morse Tone Activity Detector")
-    print(f"FS={FS} Hz, FC={FC} Hz, BW={BW} Hz, frame={FRAME_SEC*1000:.0f} ms")
-    print("Calibration: stay quiet... (Ctrl+C to stop)")
+    fs, x = load_wav_mono_resampled(args.wav, FS_DEFAULT)
 
-    cal_frames = int(CALIB_SEC / FRAME_SEC)
-    cal_energies = []
+    skip = int(WAV_SKIP_SEC * fs)
+    if 0 < skip < len(x):
+        x = x[skip:]
 
-    try:
-        for _ in range(cal_frames):
-            x = rec_frame(frame_len)
-            freqs, mag = compute_fft(x, FS)
-            cal_energies.append(band_energy_fft(freqs, mag, fc=FC, bw=BW))
-    except KeyboardInterrupt:
-        print("Stopped during calibration.")
-        return
+    print(f"WAV loaded: {args.wav} (fs={fs}, N={len(x)})")
 
-    thr = calibrate_threshold(cal_energies, k=4.0)
-    print(f"Threshold = {thr:.2f}")
-    print("Play 800Hz tone. Ctrl+C to stop.")
+    text = decode_offline_wav(x, fs)
+    print("Final Decoded Text:", text)
 
-    state = "OFF"
-    state_start = now()
-
-    energy_hist = []
-    t_hist = []
-
-    try:
-        while True:
-            x = rec_frame(frame_len)
-            freqs, mag = compute_fft(x, FS)
-            e = band_energy_fft(freqs, mag, fc=FC, bw=BW)
-
-            t_hist.append(now())
-            energy_hist.append(e)
-
-            new_state = "ON" if e >= thr else "OFF"
-
-            if new_state != state:
-                dur = now() - state_start
-                print(f"{state} duration: {dur:.3f} sec -> {new_state}")
-                state = new_state
-                state_start = now()
-
-            max_len = int(10 / FRAME_SEC)
-            if len(energy_hist) > max_len:
-                energy_hist = energy_hist[-max_len:]
-                t_hist = t_hist[-max_len:]
-
-    except KeyboardInterrupt:
-        print("Stopped.")
-    finally:
-        if len(energy_hist) >= 5:
-            t0 = t_hist[0]
-            tt = [ti - t0 for ti in t_hist]
-            plt.plot(tt, energy_hist)
-            plt.axhline(thr, linestyle="--")
-            plt.xlabel("Time (sec)")
-            plt.ylabel("Band Energy")
-            plt.title("800Hz Band Energy vs Time")
-            plt.tight_layout()
-            plt.savefig("energy_timeline.png")
-            plt.close()
-            print("Saved energy_timeline.png")
 
 if __name__ == "__main__":
     main()
